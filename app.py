@@ -520,15 +520,26 @@ def index():
       background: var(--accent);
       border: none;
       color: #041423;
-      padding: 8px 14px;
+      padding: 10px 16px;
       border-radius: 8px;
       cursor: pointer;
-      font-weight: 600;
-      transition: opacity 0.2s ease;
+      font-weight: 700;
+      font-size: 0.95rem;
+      transition: all 0.2s ease;
+      flex-shrink: 0;
+      white-space: nowrap;
+      user-select: none;
     }
 
     .chat-send-btn:hover {
+      opacity: 0.85;
+      transform: translateY(-1px);
+      box-shadow: 0 2px 8px rgba(62, 231, 198, 0.4);
+    }
+
+    .chat-send-btn:active {
       opacity: 0.9;
+      transform: translateY(0);
     }
 
     .chat-close-btn {
@@ -1147,7 +1158,11 @@ def index():
     async function sendMessage() {
       const input = document.getElementById('chatInput');
       const text = input.value.trim();
-      if (!text) return;
+      
+      if (!text) {
+        console.warn('Input is empty');
+        return;
+      }
 
       input.value = '';
       addMessage(text, true);
@@ -1158,21 +1173,46 @@ def index():
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: text })
         });
+        
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        }
+        
         const json = await res.json();
         if (json.response) {
           addBotMessage(json.response);
         } else if (json.error) {
-          addBotMessage('Sorry, I could not process that query.');
+          addBotMessage('Error: ' + json.error);
+        } else {
+          addBotMessage('No response received');
         }
       } catch (err) {
-        addBotMessage('Connection error. Check if backend is running.');
+        console.error('Chat error:', err);
+        addBotMessage('Connection error. Check if backend is running. Error: ' + err.message);
       }
     }
 
-    document.getElementById('chatSendBtn').addEventListener('click', sendMessage);
-    document.getElementById('chatInput').addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') sendMessage();
-    });
+    // Set up event listeners with proper DOM ready handling
+    function setupChatListeners() {
+      const sendBtn = document.getElementById('chatSendBtn');
+      const chatInput = document.getElementById('chatInput');
+      
+      if (sendBtn) {
+        sendBtn.addEventListener('click', sendMessage);
+      }
+      if (chatInput) {
+        chatInput.addEventListener('keypress', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            sendMessage();
+          }
+        });
+      }
+    }
+
+    // Try to set up listeners immediately, and also on DOMContentLoaded
+    setupChatListeners();
+    document.addEventListener('DOMContentLoaded', setupChatListeners);
   </script>
 
   <!-- Chat Bubble -->
@@ -1414,65 +1454,81 @@ def chat():
     Supports:
     - "Cases in <country>" -> latest country stats
     - "Top countries" -> top 5 affected
-    - "<country> in <date range>" -> filtered country query
+    - "Deaths in <country>" -> country death count
     - "When was peak?" -> peak detection info
     """
-    import os
     import re
 
     user_message = request.json.get("message", "").strip()
     if not user_message:
         return jsonify({"error": "Empty message"}), 400
 
-    # Pattern matching for common query types (no API key needed)
     response_text = None
+    data = load_data()
 
     # Pattern 1: Top countries/countries query
     if re.search(r"top\s+(5|10|countries)|most\s+affected|global\s+totals", user_message, re.I):
-        summary = load_data()
-        gs = requests.get("http://127.0.0.1:5000/global-summary").json()
-        top5 = gs.get("top_5_affected", [])
-        if top5:
-            countries_str = ", ".join([f"{i+1}. {c['country']} ({c['confirmed']:,})" for i, c in enumerate(top5)])
-            response_text = f"**Top 5 most affected countries:**\n{countries_str}\n\n**Global totals:** {gs['totals']['confirmed']:,} confirmed cases."
+        latest_country = data["latest_country"].head(5)
+        if not latest_country.empty:
+            countries_str = ", ".join([
+                f"{i+1}. {row['Country/Region']} ({int(row['Confirmed']):,})"
+                for i, (_, row) in enumerate(latest_country.iterrows())
+            ])
+            global_totals = data["global_ts"].iloc[-1]
+            response_text = (
+                f"Top 5 most affected countries:\n{countries_str}\n\n"
+                f"Global totals: {int(global_totals['Confirmed']):,} confirmed, "
+                f"{int(global_totals['Deaths']):,} deaths"
+            )
 
     # Pattern 2: Cases in [country]
     if not response_text:
-        country_match = re.search(r"cases?\s+in\s+([a-zA-Z\s]+)", user_message, re.I)
+        country_match = re.search(r"cases?\s+in\s+([a-zA-Z\s]+?)(?:\s+in\s+\d+|$)", user_message, re.I)
         if country_match:
-            country_name = country_match.group(1).strip().title()
-            try:
-                cd_resp = requests.get(f"http://127.0.0.1:5000/country-data?country={country_name}").json()
-                if "latest" in cd_resp:
-                    latest = cd_resp["latest"]
-                    response_text = (
-                        f"**{country_name} (latest: {latest['date']}):**\n"
-                        f"- Confirmed: {latest['confirmed']:,}\n"
-                        f"- Deaths: {latest['deaths']:,}\n"
-                        f"- Active: {latest['active']:,}\n"
-                        f"- Daily new: {latest['daily_new']:,}\n"
-                        f"- Growth rate: {latest['growth_rate']:.2f}%"
-                    )
-            except:
+            country_name = country_match.group(1).strip()
+            filtered = data["country_ts"][data["country_ts"]["Country/Region"].str.lower() == country_name.lower()]
+            if not filtered.empty:
+                latest = filtered.iloc[-1]
+                response_text = (
+                    f"{country_name} (as of {latest['Date'].strftime('%Y-%m-%d')}):\n"
+                    f"- Confirmed: {int(latest['Confirmed']):,}\n"
+                    f"- Deaths: {int(latest['Deaths']):,}\n"
+                    f"- Recovered: {int(latest['Recovered']):,}\n"
+                    f"- Active: {int(latest['Active']):,}"
+                )
+            else:
                 response_text = f"Could not find data for {country_name}."
 
-    # Pattern 3: Peak query
-    if not response_text and re.search(r"peak|highest|surge", user_message, re.I):
-        gs = requests.get("http://127.0.0.1:5000/global-summary").json()
-        peak = gs.get("peak_day", {})
+    # Pattern 3: Deaths in [country]
+    if not response_text:
+        deaths_match = re.search(r"deaths?\s+in\s+([a-zA-Z\s]+)", user_message, re.I)
+        if deaths_match:
+            country_name = deaths_match.group(1).strip()
+            filtered = data["country_ts"][data["country_ts"]["Country/Region"].str.lower() == country_name.lower()]
+            if not filtered.empty:
+                latest = filtered.iloc[-1]
+                response_text = f"{country_name} has reported {int(latest['Deaths']):,} deaths as of {latest['Date'].strftime('%Y-%m-%d')}."
+            else:
+                response_text = f"Could not find data for {country_name}."
+
+    # Pattern 4: Peak query
+    if not response_text and re.search(r"peak|highest|surge|maximum", user_message, re.I):
+        global_ts = data["global_ts"]
+        peak_idx = global_ts["DailyNewConfirmed"].idxmax()
+        peak_row = global_ts.loc[peak_idx]
         response_text = (
-            f"**Peak day:** {peak.get('date')} with "
-            f"{peak.get('daily_new_confirmed', 0):,} new confirmed cases."
+            f"Peak day: {peak_row['Date'].strftime('%Y-%m-%d')} with "
+            f"{int(peak_row['DailyNewConfirmed']):,} new confirmed cases."
         )
 
     # Fallback
     if not response_text:
         response_text = (
-            "I can help you query COVID-19 data. Try:\n"
+            "I can help you with COVID-19 data. Try:\n"
             "- 'Cases in India'\n"
+            "- 'Deaths in France'\n"
             "- 'Top countries'\n"
-            "- 'When was peak?'\n"
-            "- 'Cases in France in 2021'"
+            "- 'When was peak?'"
         )
 
     return jsonify({
